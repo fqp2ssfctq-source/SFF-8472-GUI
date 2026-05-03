@@ -1,0 +1,26 @@
+# 백업 파일
+backup/
+
+# 빌드 결과물
+배포용/
+
+# DLL (외부 라이브러리)
+*.dll
+
+# 로그
+*.log
+
+# 문서
+*.xlsx
+
+# 구버전 소스
+sff8472_writer_v1.2.0.py
+sff8472_writer_v1.3.0.py
+
+# 로컬 설정
+*.json
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
