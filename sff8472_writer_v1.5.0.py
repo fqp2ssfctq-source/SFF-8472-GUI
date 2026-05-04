@@ -26,6 +26,25 @@ import threading, time, os, sys, math, logging, colorsys, json, struct
 import ctypes
 from datetime import datetime
 
+# ── 선택적 Excel 라이브러리 ──────────────────────────────
+try:
+    import openpyxl as _openpyxl
+    _HAS_OPENPYXL = True
+except ImportError:
+    _HAS_OPENPYXL = False
+
+try:
+    import xlrd as _xlrd
+    _HAS_XLRD = True
+except ImportError:
+    _HAS_XLRD = False
+
+try:
+    import xlwt as _xlwt
+    _HAS_XLWT = True
+except ImportError:
+    _HAS_XLWT = False
+
 # ── 앱 메타 ──────────────────────────────────────────────
 APP_NAME    = "SFF-8472 EEPROM Manager"
 APP_VERSION = "1.5.0"
@@ -198,7 +217,7 @@ class CP2112I2C:
     def close(self):
         self._is_open = False
         try: self._dll.HidSmbus_Close(self._handle)
-        except: pass
+        except Exception: pass
 
     def write_byte(self, i2c_addr_8bit, reg, value):
         self._check_open()
@@ -394,6 +413,22 @@ def _field_name(abs_idx):
     else:
         return _FIELD_A2.get(i, f"A2h[{i:02X}h]")
 
+def _parse_hex_cell(val):
+    """Excel 셀 값(int/float/str)을 0x00~0xFF 정수로 변환. 실패 시 None."""
+    if val is None:
+        return None
+    if isinstance(val, float):
+        if not val.is_integer():
+            return None
+        val = int(val)
+    s = str(val).strip().upper().rstrip('H')
+    if not s:
+        return None
+    try:
+        return int(s, 16)
+    except ValueError:
+        return None
+
 # ─────────────────────────────────────────────────────────
 #  EEPROM 데이터 모델
 # ─────────────────────────────────────────────────────────
@@ -405,36 +440,88 @@ class EepromData:
         self.valid_a2 = False
 
     def load_file(self, path: str):
-        """Load EEPROM file. Accepts:
-          128 rows, 1 col  → A0h bytes 0~127  (A0h 128~255 = FFh, A2h = FFh)
-          256 rows, 1 col  → A0h bytes 0~255  (A2h = FFh)
-          128 rows, 2 cols → A0h 0~127 + A2h 0~127
-          256 rows, 2 cols → A0h 0~255 + A2h 0~255  (standard format)
-        Missing bytes are filled with FFh.
+        """Load EEPROM file.
+
+        TXT format (whitespace-separated):
+          128/256 rows, col1=A0h, col2=A2h (optional)
+
+        Excel format (xlsx / xls):
+          Row 1: headers (Add., A0h, A2h) — skipped
+          Col A: address (ignored), Col B: A0h, Col C: A2h
+          128 or 256 data rows. Values may be hex strings or integers.
         """
-        a0_raw, a2_raw = [], []
-        a2_col_count = 0   # number of rows that successfully parsed an A2 value
-        with open(path, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line: continue
-                parts = line.split()
-                try:
-                    a0_raw.append(int(parts[0], 16))
-                except (ValueError, IndexError):
+        ext = os.path.splitext(path)[1].lower()
+
+        if ext in ('.xlsx', '.xlsm'):
+            if not _HAS_OPENPYXL:
+                raise RuntimeError(
+                    "openpyxl이 설치되지 않았습니다.\n"
+                    "pip install openpyxl 을 실행하세요.")
+            wb = _openpyxl.load_workbook(path, read_only=True, data_only=True)
+            ws = wb.active
+            a0_raw, a2_raw, a2_col_count = [], [], 0
+            first = True
+            for row in ws.iter_rows(values_only=True):
+                if first:          # 헤더 행 건너뜀
+                    first = False
                     continue
-                if len(parts) >= 2:
-                    try:
-                        a2_raw.append(int(parts[1], 16))
-                        a2_col_count += 1
-                    except ValueError:
-                        a2_raw.append(0xFF)
+                a0v = _parse_hex_cell(row[1] if len(row) > 1 else None)
+                if a0v is None:
+                    continue
+                a0_raw.append(a0v)
+                a2v = _parse_hex_cell(row[2] if len(row) > 2 else None)
+                if a2v is not None:
+                    a2_raw.append(a2v)
+                    a2_col_count += 1
+                else:
+                    a2_raw.append(0xFF)
+            wb.close()
+
+        elif ext == '.xls':
+            if not _HAS_XLRD:
+                raise RuntimeError(
+                    "xlrd가 설치되지 않았습니다.\n"
+                    "pip install xlrd==1.2.0 을 실행하세요.")
+            wb = _xlrd.open_workbook(path)
+            ws = wb.sheet_by_index(0)
+            a0_raw, a2_raw, a2_col_count = [], [], 0
+            for r in range(1, ws.nrows):   # 헤더 행(0) 건너뜀
+                a0v = _parse_hex_cell(ws.cell_value(r, 1) if ws.ncols > 1 else None)
+                if a0v is None:
+                    continue
+                a0_raw.append(a0v)
+                a2v = _parse_hex_cell(ws.cell_value(r, 2) if ws.ncols > 2 else None)
+                if a2v is not None:
+                    a2_raw.append(a2v)
+                    a2_col_count += 1
                 else:
                     a2_raw.append(0xFF)
 
+        else:
+            # ── TXT 파싱 (기존 로직) ────────────────────
+            a0_raw, a2_raw = [], []
+            a2_col_count = 0
+            with open(path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line: continue
+                    parts = line.split()
+                    try:
+                        a0_raw.append(int(parts[0], 16))
+                    except (ValueError, IndexError):
+                        continue
+                    if len(parts) >= 2:
+                        try:
+                            a2_raw.append(int(parts[1], 16))
+                            a2_col_count += 1
+                        except ValueError:
+                            a2_raw.append(0xFF)
+                    else:
+                        a2_raw.append(0xFF)
+
         n = len(a0_raw)
         if n not in (128, 256):
-            raise ValueError(f"File must have 128 or 256 data lines, got {n}")
+            raise ValueError(f"데이터 행이 128 또는 256이어야 합니다 (현재 {n}행)")
 
         # A2h is valid only if majority of rows had a second column
         has_a2 = (a2_col_count >= n // 2)
@@ -449,9 +536,39 @@ class EepromData:
         self.valid_a2 = has_a2
 
     def save_file(self, path: str):
-        with open(path, "w") as f:
+        ext = os.path.splitext(path)[1].lower()
+
+        if ext in ('.xlsx', '.xlsm'):
+            if not _HAS_OPENPYXL:
+                raise RuntimeError(
+                    "openpyxl이 설치되지 않았습니다.\n"
+                    "pip install openpyxl 을 실행하세요.")
+            wb = _openpyxl.Workbook()
+            ws = wb.active
+            ws.append(["Add.", "A0h", "A2h"])
             for i in range(256):
-                f.write(f"{self.a0[i]:02X}\t{self.a2[i]:02X}\n")
+                ws.append([i, f"{self.a0[i]:02X}", f"{self.a2[i]:02X}"])
+            wb.save(path)
+
+        elif ext == '.xls':
+            if not _HAS_XLWT:
+                raise RuntimeError(
+                    "xlwt가 설치되지 않았습니다.\n"
+                    "pip install xlwt 을 실행하세요.")
+            wb = _xlwt.Workbook()
+            ws = wb.add_sheet("EEPROM")
+            for col, hdr in enumerate(["Add.", "A0h", "A2h"]):
+                ws.write(0, col, hdr)
+            for i in range(256):
+                ws.write(i + 1, 0, i)
+                ws.write(i + 1, 1, f"{self.a0[i]:02X}")
+                ws.write(i + 1, 2, f"{self.a2[i]:02X}")
+            wb.save(path)
+
+        else:
+            with open(path, "w") as f:
+                for i in range(256):
+                    f.write(f"{self.a0[i]:02X}\t{self.a2[i]:02X}\n")
 
     # ── 체크섬 ──────────────────────────────────────────
     def calc_cc_base(self): return sum(self.a0[0:63]) & 0xFF
@@ -836,7 +953,7 @@ class HexViewer(tk.Frame):
         for col, w in widths.items():
             try:
                 self._tv.column(col, width=int(w))
-            except: pass
+            except Exception: pass
 
     def set_data(self, data: list, diff_indices: set = None):
         self._data    = list(data)
@@ -978,6 +1095,7 @@ _ALM_DEFS = [
     (116,7,"Temp High Warn"),    (116,6,"Temp Low Warn"),
     (116,5,"Vcc High Warn"),     (116,4,"Vcc Low Warn"),
     (116,3,"TX Bias High Warn"), (116,2,"TX Bias Low Warn"),
+    (116,1,"TX Pwr High Warn"),  (116,0,"TX Pwr Low Warn"),
     (117,7,"RX Pwr High Warn"),  (117,6,"RX Pwr Low Warn"),
 ]
 
@@ -997,7 +1115,6 @@ class SFF8472App(tk.Tk):
         self._ref          = EepromData()
         self._ref_path     = ""
         self._device_index = -1
-        self._conn: CP2112I2C = None
         self._exc_vars: dict = {}
         self._ddm_auto     = tk.BooleanVar(value=False)
         self._ddm_stop     = threading.Event()
@@ -1016,6 +1133,8 @@ class SFF8472App(tk.Tk):
         # Password Unlock
         self._pw_addr_vars = [tk.StringVar(value=v) for v in ["7A","7B","7C","7D"]]
         self._pw_val_vars  = [tk.StringVar(value="00") for _ in range(4)]
+
+        self._a2_ver = 0   # incremented on every a2 data change; used for threshold cache
 
         # DDM 인터벌 (초)
         self._ddm_interval = tk.IntVar(value=2)
@@ -1606,7 +1725,7 @@ class SFF8472App(tk.Tk):
                 self._module_lbl.config(
                     text="  No module — auto-identify after connection",
                     fg=_THEME["t4"])
-            except: pass
+            except Exception: pass
             self._set_dut_status("not_read")
             self._log("Disconnected")
             return
@@ -1654,7 +1773,7 @@ class SFF8472App(tk.Tk):
             text, color = self._DUT_STATUS.get(status, ("● Unknown", None))
             fg = color if color else _THEME["t4"]
             self._dut_status_lbl.config(text=text, fg=fg)
-        except: pass
+        except Exception: pass
 
 
     def _popup_near(self, win, x_root: int, y_root: int, offset_x=20, offset_y=10):
@@ -1679,7 +1798,7 @@ class SFF8472App(tk.Tk):
         text   = f"  {vendor}  |  {pn}  |  S/N: {sn}  |  {comp}"
         try:
             self._module_lbl.config(text=text, fg=_THEME["acc_l"])
-        except: pass
+        except Exception: pass
 
     def _open_conn(self) -> CP2112I2C:
         """Open port for operation. Raises IOError if no device selected."""
@@ -1691,7 +1810,7 @@ class SFF8472App(tk.Tk):
         """Close port after operation."""
         if conn:
             try: conn.close()
-            except: pass
+            except Exception: pass
 
     def _update_conn_info(self):
         sel  = self._port_var.get()   # Combobox에 이미 표시된 항목 사용
@@ -1935,6 +2054,7 @@ class SFF8472App(tk.Tk):
                         data.extend(chunk)
                     self._dut.a2       = list(data[:256])
                     self._dut.valid_a2 = True
+                    self._a2_ver += 1
 
                 self.after(0, self._refresh_all_views)
 
@@ -2044,6 +2164,7 @@ class SFF8472App(tk.Tk):
                 chunk = conn.read_page(I2C_A2, 96, 32)
                 self._dut.a2[96:128] = list(chunk[:32])
                 self._dut.valid_a2   = True
+                self._a2_ver        += 1
                 self._ddm_fail_cnt   = 0   # reset on success
                 self.after(0, self._update_ddm_display)
                 self.after(0, lambda: self._set_dut_status("ok"))
@@ -2066,7 +2187,7 @@ class SFF8472App(tk.Tk):
         self._ddm_stop.set()
         self._ddm_auto.set(False)
         try: self._ddm_cb.deselect()
-        except: pass
+        except Exception: pass
         self._log(f"DDM auto-refresh stopped — {self._DDM_MAX_FAIL} consecutive "
                   "read failures. Check module connection.", warn=True)
         messagebox.showwarning("DDM Auto-Refresh Stopped",
@@ -2079,11 +2200,11 @@ class SFF8472App(tk.Tk):
         ddm = self._dut.get_ddm()
         use_mw = (self._pwr_unit.get() == "mW")
 
-        # Threshold cache
-        if not hasattr(self, "_thr_cache") or self._thr_cache_ver != id(self._dut.a2):
+        # Threshold cache — invalidated by _a2_ver counter
+        if not hasattr(self, "_thr_cache_ver") or self._thr_cache_ver != self._a2_ver:
             raw_thr = self._dut.decode_a2_thresholds()
             self._thr_cache     = {(r[1], r[2]): r[4] for r in raw_thr}
-            self._thr_cache_ver = id(self._dut.a2)
+            self._thr_cache_ver = self._a2_ver
         thr_map = self._thr_cache
 
         # Alarm / warning bitmaps
@@ -2156,7 +2277,7 @@ class SFF8472App(tk.Tk):
             wd["unit_lbl"].config(bg=card_bg, fg=fg_col)
             for child in wd["label"].master.winfo_children():
                 try: child.config(bg=card_bg)
-                except: pass
+                except Exception: pass
 
             # Progress bar
             hi, lo = wd["hi"], wd["lo"]
@@ -2193,7 +2314,7 @@ class SFF8472App(tk.Tk):
                 text=f"Cal: {ddm.get('cal_type','—')}",
                 fg=_THEME["acc_l"] if ddm.get("cal_type")=="External"
                 else _THEME["t3"])
-        except: pass
+        except Exception: pass
 
         # 알람 테이블
         for item in self._alm_tv.get_children():
@@ -2249,7 +2370,10 @@ class SFF8472App(tk.Tk):
     def _load_reference(self):
         path = filedialog.askopenfilename(
             title="Select Reference File",
-            filetypes=[("Text files","*.txt"),("All files","*.*")])
+            filetypes=[("EEPROM files","*.txt *.xlsx *.xlsm *.xls"),
+                       ("Text files","*.txt"),
+                       ("Excel files","*.xlsx *.xlsm *.xls"),
+                       ("All files","*.*")])
         if not path: return
         try:
             self._ref.load_file(path)
@@ -2276,6 +2400,17 @@ class SFF8472App(tk.Tk):
             checked = var.get() if var is not None else default
             if checked:
                 exc_set.update(indices)
+
+        # 유효하지 않은 페이지는 자동 제외 — FFh 기본값과 비교해 false FAIL 방지
+        if not self._ref.valid_a2:
+            exc_set.update(range(256, 512))
+            self._log("Reference has no A2h data — A2h excluded from comparison", warn=True)
+        if not self._dut.valid_a2:
+            exc_set.update(range(256, 512))
+            self._log("DUT A2h not read — A2h excluded from comparison", warn=True)
+        if not self._dut.valid_a0:
+            exc_set.update(range(0, 256))
+            self._log("DUT A0h not read — A0h excluded from comparison", warn=True)
         dut_flat = self._dut.a0 + self._dut.a2
         ref_flat = self._ref.a0 + self._ref.a2
 
@@ -2334,9 +2469,12 @@ class SFF8472App(tk.Tk):
     # ═══════════════════════════════════════════════════
     def _save_file(self):
         path = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Text files","*.txt"),("All files","*.*")],
-            initialfile=f"eeprom_{datetime.now().strftime('%y%m%d_%H%M%S')}.txt")
+            defaultextension=".xlsx",
+            filetypes=[("Excel xlsx","*.xlsx"),
+                       ("Excel xls","*.xls"),
+                       ("Text files","*.txt"),
+                       ("All files","*.*")],
+            initialfile=f"eeprom_{datetime.now().strftime('%y%m%d_%H%M%S')}.xlsx")
         if not path: return
         try:
             self._dut.save_file(path)
@@ -2347,7 +2485,10 @@ class SFF8472App(tk.Tk):
     def _open_file(self):
         path = filedialog.askopenfilename(
             title="Open EEPROM File",
-            filetypes=[("Text files","*.txt"),("All files","*.*")])
+            filetypes=[("EEPROM files","*.txt *.xlsx *.xlsm *.xls"),
+                       ("Text files","*.txt"),
+                       ("Excel files","*.xlsx *.xlsm *.xls"),
+                       ("All files","*.*")])
         if not path: return
         try:
             self._dut.load_file(path)
@@ -2437,7 +2578,7 @@ class SFF8472App(tk.Tk):
         # Strip unit from current value for default
         try:
             entry.insert(0, cur_phys.split()[0])
-        except: pass
+        except Exception: pass
 
         result_lbl = tk.Label(fr, text="Raw: —", bg=_THEME["bg1"],
                               fg=_THEME["t3"], font=("Consolas",9))
@@ -2465,9 +2606,7 @@ class SFF8472App(tk.Tk):
                 lsb_v = raw & 0xFF
                 self._dut.a2[msb] = msb_v
                 self._dut.a2[lsb] = lsb_v
-                # Invalidate threshold cache
-                if hasattr(self, "_thr_cache_ver"):
-                    self._thr_cache_ver = -1
+                self._a2_ver += 1
                 self._refresh_thresholds()
                 self._hex_a2.set_data(self._dut.a2)
                 self._log(f"Threshold {field} {type_}: "
@@ -2795,10 +2934,15 @@ class SFF8472App(tk.Tk):
         try:
             conn = self._open_conn()
             conn.write_byte(i2c_addr, reg, val)
-            if page == "A0h": self._dut.a0[reg] = val
-            else:              self._dut.a2[reg] = val
+            if page == "A0h":
+                self._dut.a0[reg] = val
+                self._dut.a0[63] = self._dut.calc_cc_base()
+                self._dut.a0[95] = self._dut.calc_cc_ext()
+            else:
+                self._dut.a2[reg] = val
+                self._dut.a2[95] = self._dut.calc_cc_dmi()
             self._refresh_all_views()
-            self._log(f"Write {page} [{reg:02X}h] = {val:02X}h", ok=True)
+            self._log(f"Write {page} [{reg:02X}h] = {val:02X}h  CC recalculated", ok=True)
             win.destroy()
         except Exception as e:
             messagebox.showerror("Write Error", str(e), parent=win)
@@ -2827,7 +2971,7 @@ class SFF8472App(tk.Tk):
             self._log_txt.insert("end", txt + "\n", tag)
             self._log_txt.see("end")
             self._log_txt.configure(state="disabled")
-        except: pass
+        except Exception: pass
 
     def _clear_log(self):
         self._log_lines.clear()
@@ -2835,7 +2979,7 @@ class SFF8472App(tk.Tk):
             self._log_txt.configure(state="normal")
             self._log_txt.delete("1.0","end")
             self._log_txt.configure(state="disabled")
-        except: pass
+        except Exception: pass
 
     def _save_log(self):
         path = filedialog.asksaveasfilename(
@@ -2858,14 +3002,14 @@ class SFF8472App(tk.Tk):
         try:
             for attr in ("_conn_btn",):
                 getattr(self, attr).config(state=state)
-        except: pass
+        except Exception: pass
         # page_bar 버튼들
         try:
             for child in self._page_bar.winfo_children():
                 cls = child.winfo_class()
                 if cls == "Button":
                     child.config(state=state)
-        except: pass
+        except Exception: pass
 
     # ═══════════════════════════════════════════════════
     #  테마
@@ -2889,14 +3033,14 @@ class SFF8472App(tk.Tk):
             self._module_bar.config(bg=t["bg0"])
             self._module_lbl.config(bg=t["bg0"])
             self._dut_status_lbl.config(bg=t["bg0"])
-        except: pass
+        except Exception: pass
         try:
             self._log_txt.config(bg=t["bg2"], fg=t["t1"])
             self._log_txt.tag_configure("err",  foreground=t["red"])
             self._log_txt.tag_configure("ok",   foreground=t["grn"])
             self._log_txt.tag_configure("warn", foreground=t["yel"])
             self._log_txt.tag_configure("info", foreground=t["t2"])
-        except: pass
+        except Exception: pass
 
     def _walk(self, widget, t):
         cls = widget.winfo_class()
@@ -2915,7 +3059,7 @@ class SFF8472App(tk.Tk):
                         widget.config(bg=t["acc_d"])
                     else:
                         widget.config(bg=t["bg1"], fg=t["t1"])
-                except: pass
+                except Exception: pass
             elif cls == "Button":
                 if widget is self._theme_btn:
                     widget.config(bg=t["acc_d"], fg=t["t2"],
@@ -2934,7 +3078,7 @@ class SFF8472App(tk.Tk):
                 widget.config(bg=t["bg1"], fg=t["t1"],
                                activebackground=t["bg1"],
                                selectcolor=t["bg2"])
-        except: pass
+        except Exception: pass
         for child in widget.winfo_children():
             self._walk(child, t)
 
@@ -3004,10 +3148,10 @@ class SFF8472App(tk.Tk):
             geo = cfg.get("geometry")
             if geo:
                 try: self.geometry(geo)
-                except: pass
+                except Exception: pass
 
             # 테마
-            dark = cfg.get("dark_mode", True)
+            dark = cfg.get("dark_mode", False)
             if dark != self._dark:
                 self._dark = dark
                 self._theme_btn.config(
@@ -3041,7 +3185,7 @@ class SFF8472App(tk.Tk):
                     self._ref_path = ref
                     self._ref_path_lbl.config(text=os.path.basename(ref))
                     self._log(f"Reference file restored: {os.path.basename(ref)}")
-                except: pass
+                except Exception: pass
 
             # 장치 인덱스 (포트 새로고침 후 선택)
             di = cfg.get("device_index", -1)
