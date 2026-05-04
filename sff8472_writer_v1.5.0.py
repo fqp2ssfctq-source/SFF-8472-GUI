@@ -339,6 +339,53 @@ SFF8472_COMP_MAP = {
     0x09:"Rev 12.4",  0x0A:"Rev 12.5",
 }
 
+# ── Transceiver Compliance Codes bit 정의 (SFF-8472 Table 5-3) ──────────────
+_COMP_BITS = {
+    3: [  # 10G Ethernet (bits 7-4) + Infiniband (bits 3-0)
+        (7, "10GBase-ER"), (6, "10GBase-LRM"),
+        (5, "10GBase-LR"), (4, "10GBase-SR"),
+        (3, "1X SX"), (2, "1X LX"), (1, "Cu Active"), (0, "Cu Passive"),
+    ],
+    4: [  # SONET Compliance (upper)
+        (7, "OC48-LR"), (6, "OC48-IR"), (5, "OC48-SR"),
+        (3, "OC12-LR"), (2, "OC12-IR"), (1, "OC12-SR"),
+    ],
+    5: [  # SONET Compliance (lower)
+        (7, "OC3-LR"), (6, "OC3-IR"), (4, "OC3-SR"),
+    ],
+    6: [  # Gigabit Ethernet
+        (3, "1000Base-T"), (2, "1000Base-CX"),
+        (1, "1000Base-LX"), (0, "1000Base-SX"),
+    ],
+    7: [  # FC Link Length
+        (7, "FC-VLD"), (6, "FC-SHT"), (5, "FC-INT"),
+        (4, "FC-LNG"), (3, "FC-MED"),
+    ],
+    8: [  # FC Technology
+        (7, "EL Inter-Encl"), (6, "LC Longwave"),
+        (4, "EL Intra-Encl"), (3, "SN w/OFC"),
+        (2, "SL w/o OFC"),    (1, "LL Longwave"),
+    ],
+    9: [  # SFP+ Cable Technology / FC Transmission Media
+        (7, "Active Cable"), (6, "Passive Cable"),
+        (5, "M6 62.5um"), (4, "M5 50um"), (2, "SM"),
+    ],
+    10: [  # FC Speed
+        (7, "1200 MBd"), (6, "800 MBd"), (5, "1600 MBd"),
+        (4, "400 MBd"),  (2, "200 MBd"), (0, "100 MBd"),
+    ],
+}
+_COMP_NAMES = {
+    3:  "10GE+IB Compliance",
+    4:  "SONET Compliance [hi]",
+    5:  "SONET Compliance [lo]",
+    6:  "GbE Compliance",
+    7:  "FC Link Length",
+    8:  "FC Technology",
+    9:  "SFP+ Cable/FC Media",
+    10: "FC Speed",
+}
+
 # 비교 예외 기본값
 # (label, indices, default_checked)
 _A2 = 256
@@ -622,8 +669,28 @@ class EepromData:
         _r(0,  "Identifier",          _h(d[0]),  _lk(IDENTIFIER_MAP, d[0]))
         _r(1,  "Ext Identifier",      _h(d[1]),  _lk(EXT_ID_MAP, d[1]))
         _r(2,  "Connector",           _h(d[2]),  _lk(CONNECTOR_MAP, d[2]))
-        comp = " ".join(f"{d[i]:02X}" for i in range(3,11))
-        _r(3,  "Compliance [3-10]",   comp,      "(Table 5-3)")
+        _MAX_DEC = 38   # decoded 컬럼 한 줄 최대 글자 수
+        for _ca in range(3, 11):
+            _cbits  = _COMP_BITS.get(_ca, [])
+            _cname  = _COMP_NAMES.get(_ca, f"Compliance[{_ca}]")
+            _active = [lbl for bit, lbl in _cbits if d[_ca] & (1 << bit)]
+            if not _active:
+                _r(_ca, _cname, _h(d[_ca]), "—")
+                continue
+            # 너무 길면 _MAX_DEC 기준으로 줄 나눔
+            _lines, _cur = [], []
+            for lbl in _active:
+                _test = ", ".join(_cur + [lbl])
+                if _cur and len(_test) > _MAX_DEC:
+                    _lines.append(", ".join(_cur))
+                    _cur = [lbl]
+                else:
+                    _cur.append(lbl)
+            if _cur:
+                _lines.append(", ".join(_cur))
+            rows.append((f"{_ca:3d} ({_h(_ca)})", _cname, _h(d[_ca]), _lines[0]))
+            for _ln in _lines[1:]:
+                rows.append(("", "", "", f"  {_ln}"))
         _r(11, "Encoding",            _h(d[11]), _lk(ENCODING_MAP, d[11]))
         rn = d[12]
         rs = ">25.4 GBd (byte 66-67)" if rn==0xFF else ("Not specified" if rn==0 else f"{rn*100} MBd")
@@ -1424,17 +1491,23 @@ class SFF8472App(tk.Tk):
                  fg=_THEME["acc"], font=("Consolas",10,"bold")
                  ).pack(anchor="w", padx=4, pady=(4,0))
         cols = ("Addr", "Field", "Value", "Decoded")
-        self._dec_tv = ttk.Treeview(right, columns=cols,
+        _dtv_fr = tk.Frame(right, bg=_THEME["bg1"])
+        _dtv_fr.pack(fill="both", expand=True)
+        _dtv_fr.grid_rowconfigure(0, weight=1)
+        _dtv_fr.grid_columnconfigure(0, weight=1)
+        self._dec_tv = ttk.Treeview(_dtv_fr, columns=cols,
                                      show="headings", height=24,
                                      style="Gen.Treeview")
         widths = {"Addr":80, "Field":160, "Value":80, "Decoded":220}
         for c in cols:
             self._dec_tv.heading(c, text=c)
-            self._dec_tv.column(c, width=widths[c], anchor="w")
-        sb2 = ttk.Scrollbar(right, orient="vertical", command=self._dec_tv.yview)
-        self._dec_tv.configure(yscrollcommand=sb2.set)
-        self._dec_tv.pack(side="left", fill="both", expand=True)
-        sb2.pack(side="left", fill="y")
+            self._dec_tv.column(c, width=widths[c], anchor="w", stretch=False)
+        sb2   = ttk.Scrollbar(_dtv_fr, orient="vertical",   command=self._dec_tv.yview)
+        sb2x  = ttk.Scrollbar(_dtv_fr, orient="horizontal", command=self._dec_tv.xview)
+        self._dec_tv.configure(yscrollcommand=sb2.set, xscrollcommand=sb2x.set)
+        self._dec_tv.grid(row=0, column=0, sticky="nsew")
+        sb2.grid(row=0, column=1, sticky="ns")
+        sb2x.grid(row=1, column=0, sticky="ew")
         self._dec_tv.bind("<Double-1>", self._on_decoded_click)
         pane.add(right, minsize=380)
 
@@ -3130,6 +3203,8 @@ class SFF8472App(tk.Tk):
                 "pw_val":       [v.get() for v in self._pw_val_vars],
                 "hex_a0_cols":  self._hex_a0.get_col_widths(),
                 "hex_a2_cols":  self._hex_a2.get_col_widths(),
+                "dec_cols":     {c: self._dec_tv.column(c, "width")
+                                 for c in ("Addr", "Field", "Value", "Decoded")},
             }
             with open(self._config_path(), "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -3197,6 +3272,12 @@ class SFF8472App(tk.Tk):
                 self._hex_a0.set_col_widths(cfg["hex_a0_cols"])
             if "hex_a2_cols" in cfg:
                 self._hex_a2.set_col_widths(cfg["hex_a2_cols"])
+            if "dec_cols" in cfg:
+                for col, w in cfg["dec_cols"].items():
+                    try:
+                        self._dec_tv.column(col, width=int(w))
+                    except Exception:
+                        pass
 
             self._log("Settings restored")
         except Exception as e:
